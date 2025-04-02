@@ -34,6 +34,7 @@ function App() {
   const [isNavigating, setIsNavigating] = useState(false);
   const [stream, setStream] = useAtom(ShareStream);
   const [navigationMode, setNavigationMode] = useAtom(NavigationModeAtom);
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const [directionalAudioEnabled, setDirectionalAudioEnabled] = useAtom(DirectionalAudioEnabledAtom);
 
   useEffect(() => {
