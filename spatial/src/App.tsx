@@ -34,7 +34,8 @@ function App() {
   const [isNavigating, setIsNavigating] = useState(false);
   const [stream, setStream] = useAtom(ShareStream);
   const [navigationMode, setNavigationMode] = useAtom(NavigationModeAtom);
-  const [directionalAudioEnabled, setDirectionalAudioEnabled] = useAtom(DirectionalAudioEnabledAtom);
+  const [_directionalAudioEnabled, setDirectionalAudioEnabled] = useAtom(DirectionalAudioEnabledAtom);
+  const [cameraError, setCameraError] = useState<string | null>(null);
 
   useEffect(() => {
     setInitFinished(true);
@@ -46,20 +47,38 @@ function App() {
 
   const startNavigation = async () => {
     try {
-      const cameraStream = await navigator.mediaDevices.getUserMedia({ 
-        video: { facingMode: "environment" },
-        audio: false 
-      });
-      setStream(cameraStream);
-      setIsNavigating(true);
+      setCameraError(null);
       
-      // Enable directional audio in detailed and advanced modes
-      if (navigationMode !== 'basic') {
-        setDirectionalAudioEnabled(true);
+      // First try to get camera access with rear-facing camera preference
+      try {
+        const cameraStream = await navigator.mediaDevices.getUserMedia({
+          video: { 
+            facingMode: { ideal: "environment" },
+            width: { ideal: 1280 },
+            height: { ideal: 720 }
+          },
+          audio: false
+        });
+        
+        console.log('Successfully connected to camera');
+        setStream(cameraStream);
+        setIsNavigating(true);
+        
+        // Enable directional audio in detailed and advanced modes
+        if (navigationMode !== 'basic') {
+          setDirectionalAudioEnabled(true);
+        }
+        return;
+      } catch (err) {
+        console.error('Error accessing camera:', err);
+        throw err; // Re-throw to be caught by outer try-catch
       }
-      
     } catch (err) {
-      console.error("Error accessing camera:", err);
+      console.error("Error:", err);
+      setCameraError(
+        "Could not access camera. Please ensure you've given camera permissions and try again. " +
+        "If using your phone, make sure you're accessing this page through HTTPS."
+      );
     }
   };
 
@@ -70,6 +89,7 @@ function App() {
     }
     setIsNavigating(false);
     setDirectionalAudioEnabled(false);
+    setCameraError(null);
     resetState();
   };
   
@@ -96,6 +116,13 @@ function App() {
         <ExtraModeControls />
       </div>
       <div className="flex shrink-0 w-full overflow-auto py-6 px-5 gap-6 items-center justify-center flex-wrap">
+        {/* Show camera error if any */}
+        {cameraError && (
+          <div className="w-full max-w-md bg-red-600 text-white p-3 rounded-lg text-center mb-4">
+            {cameraError}
+          </div>
+        )}
+        
         <NavigationControls 
           isNavigating={isNavigating} 
           onStartNavigation={startNavigation}
