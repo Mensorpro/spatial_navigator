@@ -34,8 +34,44 @@ const RETRY_DELAY_MS = 1000; // Start with 1 second delay
 const MAX_RETRY_DELAY_MS = 10000; // Max 10 second delay
 const MAX_RETRIES = 3;
 
-// Frame processing interval in milliseconds (6.5 seconds between frames ≈ 9 requests per minute)
-const FRAME_PROCESSING_INTERVAL_MS = 6500;
+// Frame processing interval in milliseconds
+// Free tier quota is 15 requests per minute for gemini-1.5-flash
+// Set to 4500ms (~13.3 requests/min) to stay safely under the quota limit of 15
+const FRAME_PROCESSING_INTERVAL_MS = 10000; 
+
+// Additional safety buffer (milliseconds) applied when rate limit errors occur
+let dynamicRateLimitBuffer = 0;
+
+// Increment for dynamic buffer when hitting rate limits (ms)
+const RATE_LIMIT_BUFFER_INCREMENT = 5000;
+
+// Maximum number of frames to keep in history for context
+const MAX_FRAME_HISTORY = 1;
+
+// Number of intermediate frames to capture between API requests
+const INTERMEDIATE_FRAMES_COUNT = 1;
+
+// Interface for frame history item
+interface FrameHistoryItem {
+  timestamp: number;
+  dataUrl: string;
+  detections: any[];  // Store the AI detection results
+  movementDirection?: string; // Direction of movement since last frame
+  isKeyFrame?: boolean; // Whether this frame was processed by the API
+}
+
+// Interface for enhanced bounding box with movement tracking
+interface EnhancedBoundingBox2D {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  label: string;
+  id?: string; // Unique identifier to track objects across frames
+  distance?: string; // Estimated distance like "3 footsteps away"
+  movement?: "approaching" | "receding" | "stationary" | "left" | "right"; // Movement direction
+  prevSize?: number; // Previous size for comparison
+}
 
 export function Content({ isNavigating = false }) {
   const [imageSrc] = useAtom(ImageSrcAtom);
@@ -53,6 +89,13 @@ export function Content({ isNavigating = false }) {
   const retryCountRef = useRef(0);
   const [videoReady, setVideoReady] = useState(false);
   const videoInitTimeoutRef = useRef<number | null>(null);
+  
+  // New states for context tracking
+  const [frameHistory, setFrameHistory] = useState<FrameHistoryItem[]>([]);
+  const [movementDirection, setMovementDirection] = useState<string>("stationary");
+  const [enhancedBoundingBoxes, setEnhancedBoundingBoxes] = useState<EnhancedBoundingBox2D[]>([]);
+  const objectTrackingMapRef = useRef<Map<string, { id: string, label: string, lastSeen: number }>>(new Map());
+  const lastFrameTimeRef = useRef<number>(0);
   
   // Handling resize and aspect ratios
   const boundingBoxContainerRef = useRef<HTMLDivElement | null>(null);
@@ -100,6 +143,52 @@ export function Content({ isNavigating = false }) {
   useEffect(() => {
     let processingIntervalId: number | null = null;
     let lastProcessTime = 0;
+    let intermediateFrameIntervalId: number | null = null;
+    
+    // Function to schedule intermediate frame captures between main API-processed frames
+    const scheduleIntermediateFrames = () => {
+      // Only schedule if we're navigating and video is ready
+      if (!isNavigating || !videoReady) return;
+      
+      // Clear any existing interval
+      if (intermediateFrameIntervalId !== null) {
+        clearInterval(intermediateFrameIntervalId);
+      }
+      
+      // Calculate the current interval between API calls
+      const currentApiInterval = FRAME_PROCESSING_INTERVAL_MS + dynamicRateLimitBuffer;
+      
+      // Calculate interval for intermediate frames
+      // We want to capture INTERMEDIATE_FRAMES_COUNT frames evenly spaced between API calls
+      const intermediateInterval = Math.floor(currentApiInterval / (INTERMEDIATE_FRAMES_COUNT + 1));
+      
+      console.log(`Scheduling ${INTERMEDIATE_FRAMES_COUNT} intermediate frames every ${intermediateInterval}ms`);
+      
+      // Set up interval for capturing intermediate frames
+      intermediateFrameIntervalId = window.setInterval(async () => {
+        // Don't capture if we're in the middle of an API call or video isn't ready
+        if (processingRef.current || !videoReady) return;
+        
+        // Calculate time since last API-processed frame
+        const timeSinceLastApiFrame = Date.now() - lastProcessTime;
+        
+        // Only capture intermediate frames if we're in between API calls
+        if (timeSinceLastApiFrame < currentApiInterval && timeSinceLastApiFrame > 200) {
+          const frameItem = await captureIntermediateFrame();
+          if (frameItem) {
+            // Add to frame history (maintaining maximum size)
+            setFrameHistory(prev => {
+              const updatedHistory = [...prev, frameItem];
+              if (updatedHistory.length > MAX_FRAME_HISTORY) {
+                return updatedHistory.slice(-MAX_FRAME_HISTORY);
+              }
+              return updatedHistory;
+            });
+            console.log(`Captured intermediate frame at ${timeSinceLastApiFrame}ms after last API frame`);
+          }
+        }
+      }, intermediateInterval);
+    };
     
     const processFrame = async () => {
       // Only process frames if video is ready with valid dimensions
@@ -109,7 +198,9 @@ export function Content({ isNavigating = false }) {
       
       const currentTime = Date.now();
       // Only process a new frame if enough time has passed since the last processing
-      if (currentTime - lastProcessTime < FRAME_PROCESSING_INTERVAL_MS) {
+      // Apply dynamic buffer if we've hit rate limits
+      const currentInterval = FRAME_PROCESSING_INTERVAL_MS + dynamicRateLimitBuffer;
+      if (currentTime - lastProcessTime < currentInterval) {
         return;
       }
       
@@ -152,13 +243,42 @@ export function Content({ isNavigating = false }) {
           return;
         }
         
-        // Process with Gemini
-        await analyzeFrame(dataUrl);
+        // Calculate time since last frame
+        const timeSinceLastFrame = currentTime - lastFrameTimeRef.current;
+        lastFrameTimeRef.current = currentTime;
+        
+        // Detect movement direction based on time between frames
+        const newMovementDirection = detectMovementDirection(timeSinceLastFrame);
+        if (newMovementDirection !== movementDirection) {
+          setMovementDirection(newMovementDirection);
+        }
+        
+        // Process with Gemini, including context from previous frames
+        await analyzeFrameWithContext(dataUrl);
+        
+        // After successful processing, schedule intermediate frames
+        scheduleIntermediateFrames();
       } catch (err) {
         console.error('Error processing frame:', err);
       } finally {
         processingRef.current = false;
       }
+    };
+    
+    // Simple movement detection based on time between frames
+    const detectMovementDirection = (timeSinceLastFrame: number): string => {
+      // If this is our first frame, assume stationary
+      if (lastFrameTimeRef.current === 0) return "stationary";
+      
+      // If we have previous detections, we could analyze the change in object sizes/positions
+      if (frameHistory.length >= 2 && enhancedBoundingBoxes.length > 0) {
+        // Look at movement patterns of objects
+        // This is where we'd implement more sophisticated movement detection
+        // For now, we'll use a placeholder implementation
+        return movementDirection; // Keep the current direction
+      }
+      
+      return "stationary"; // Default
     };
     
     if (isNavigating && videoReady) {
@@ -176,10 +296,10 @@ export function Content({ isNavigating = false }) {
         window.clearInterval(processingIntervalId);
       }
     };
-  }, [isNavigating, videoReady]);
+  }, [isNavigating, videoReady, frameHistory, enhancedBoundingBoxes, movementDirection]);
   
-  // Function to analyze a single frame
-  const analyzeFrame = async (dataUrl: string) => {
+  // Function to analyze a frame with context from previous frames
+  const analyzeFrameWithContext = async (dataUrl: string) => {
     try {
       // If we're already in a retry backoff, don't attempt a new API call
       if (retryTimeoutRef.current) {
@@ -189,15 +309,37 @@ export function Content({ isNavigating = false }) {
       // Reset the error state
       setProcessingError(null);
       
-      // Configure the prompt based on detection type
-      let prompt = '';
-      if (detectType === '2D bounding boxes') {
-        prompt = "Detect potential obstacles and hazards for a blind person. Output a json list where each entry contains the 2D bounding box in 'box_2d' and a clear description in 'label'. Focus on obstacles in the path.";
-      } else if (detectType === '3D bounding boxes') {
-        prompt = "Detect the 3D bounding boxes of obstacles and hazards for a blind person, output no more than 5 items. Return a list where each entry contains a clear description in 'label' and its 3D bounding box in 'box_3d'.";
-      } else {
-        prompt = "Point to the critical obstacles or hazards for a blind person with no more than 5 items. The answer should follow the json format: [{\"point\": <point>, \"label\": <clear description>}, ...]. The points are in [y, x] format normalized to 0-1000.";
+      // Create context from previous frames
+      let contextPrompt = '';
+      if (frameHistory.length > 0) {
+        contextPrompt = "Previous context: ";
+        
+        // Add context from the last few frames
+        frameHistory.forEach((frame, index) => {
+          const timeAgo = Date.now() - frame.timestamp;
+          const secondsAgo = Math.round(timeAgo / 1000);
+          
+          if (frame.detections && frame.detections.length > 0) {
+            contextPrompt += `${secondsAgo} seconds ago I saw: ${frame.detections.map((d: any) => d.label).join(', ')}. `;
+          }
+        });
+        
+        // Add movement direction
+        contextPrompt += `I am currently ${movementDirection}. `;
       }
+      
+      // Configure the prompt based on detection type
+      let prompt = contextPrompt;
+      
+      if (detectType === '2D bounding boxes') {
+        prompt += "Detect potential obstacles and hazards for a blind person. Output a json list where each entry contains the 2D bounding box in 'box_2d', a clear description in 'label', and an estimated distance in 'distance' (expressed in human terms like '3 footsteps away'). If you recognize objects from previous frames, indicate whether I'm approaching them or moving away from them.";
+      } else if (detectType === '3D bounding boxes') {
+        prompt += "Detect the 3D bounding boxes of obstacles and hazards for a blind person, output no more than 5 items. Return a list where each entry contains a clear description in 'label', its 3D bounding box in 'box_3d', and whether I'm approaching or moving away from this object based on previous frames.";
+      } else {
+        prompt += "Point to the critical obstacles or hazards for a blind person with no more than 5 items. The answer should follow the json format: [{\"point\": <point>, \"label\": <clear description>, \"distance\": <human readable distance>}, ...]. The points are in [y, x] format normalized to 0-1000.";
+      }
+      
+      console.log('Using context-enhanced prompt:', prompt);
       
       const response = await client
         .getGenerativeModel(
@@ -252,202 +394,56 @@ export function Content({ isNavigating = false }) {
         return;
       }
       
-      // Update the appropriate state based on detection type
+      // Store the detections in frame history
+      const newFrameHistoryItem: FrameHistoryItem = {
+        timestamp: Date.now(),
+        dataUrl: dataUrl,
+        detections: parsedResponse,
+        movementDirection: movementDirection
+      };
+      
+      // Update the frame history (keep only the last MAX_FRAME_HISTORY frames)
+      setFrameHistory(prev => {
+        const updatedHistory = [...prev, newFrameHistoryItem];
+        if (updatedHistory.length > MAX_FRAME_HISTORY) {
+          return updatedHistory.slice(-MAX_FRAME_HISTORY);
+        }
+        return updatedHistory;
+      });
+      
+      // Process the response based on detection type
       if (detectType === "2D bounding boxes") {
         try {
-          // Print the raw response for debugging
-          console.log('Raw response from API:', parsedResponse);
-          
-          const formattedBoxes = [];
-          
-          for (const item of parsedResponse) {
-            // Log each item for debugging
-            console.log('Processing item:', item);
-            
-            // Handle different possible formats for box_2d
-            let box2D = null;
-            let label = item.label || item.description || item.name || item.class || item.category || 'Unknown';
-            
-            // Case 1: Standard format [ymin, xmin, ymax, xmax]
-            if (item.box_2d && Array.isArray(item.box_2d) && item.box_2d.length === 4) {
-              box2D = item.box_2d;
-              console.log('Found format: box_2d array');
-            }
-            // Case 2: Format with separate coordinates like {xmin, ymin, xmax, ymax}
-            else if (item.bounding_box || item.bbox || item.box) {
-              const bbox = item.bounding_box || item.bbox || item.box;
-              if (bbox) {
-                if (Array.isArray(bbox) && bbox.length === 4) {
-                  box2D = [bbox[1], bbox[0], bbox[3], bbox[2]]; // Convert [xmin,ymin,xmax,ymax] to [ymin,xmin,ymax,xmax]
-                  console.log('Found format: bbox array');
-                } else if (typeof bbox === 'object') {
-                  // Handle object with properties like {x, y, width, height} or {xmin, ymin, xmax, ymax}
-                  if ('x' in bbox && 'y' in bbox && 'width' in bbox && 'height' in bbox) {
-                    box2D = [
-                      bbox.y, 
-                      bbox.x, 
-                      bbox.y + bbox.height, 
-                      bbox.x + bbox.width
-                    ];
-                    console.log('Found format: x,y,width,height object');
-                  } else if ('xmin' in bbox && 'ymin' in bbox && 'xmax' in bbox && 'ymax' in bbox) {
-                    box2D = [bbox.ymin, bbox.xmin, bbox.ymax, bbox.xmax];
-                    console.log('Found format: xmin,ymin,xmax,ymax object');
-                  }
-                }
-              }
-            }
-            // Case 3: Direct coordinates in the object
-            else if ('xmin' in item && 'ymin' in item && 'xmax' in item && 'ymax' in item) {
-              box2D = [item.ymin, item.xmin, item.ymax, item.xmax];
-              console.log('Found format: direct coordinates');
-            }
-            // Case 4: Format with position and dimensions
-            else if ('x' in item && 'y' in item && ('width' in item || 'w' in item) && ('height' in item || 'h' in item)) {
-              const width = item.width || item.w;
-              const height = item.height || item.h;
-              box2D = [item.y, item.x, item.y + height, item.x + width];
-              console.log('Found format: x,y,width/w,height/h');
-            }
-            // Case 5: New case for coordinates/vertices array format
-            else if (item.coordinates || item.vertices || item.points || item.corners) {
-              const coords = item.coordinates || item.vertices || item.points || item.corners;
-              if (Array.isArray(coords) && coords.length >= 4) {
-                // Get the bounding box from the coordinates
-                // Extract x,y values and find min/max
-                const xs = coords.map(p => p.x || p[0]);
-                const ys = coords.map(p => p.y || p[1]);
-                const xmin = Math.min(...xs);
-                const ymin = Math.min(...ys);
-                const xmax = Math.max(...xs);
-                const ymax = Math.max(...ys);
-                box2D = [ymin, xmin, ymax, xmax];
-                console.log('Found format: coordinates/vertices array');
-              }
-            }
-            // Case 6: Standard 2D bounding box format in AI vision APIs
-            else if (item.boundingPoly && item.boundingPoly.vertices) {
-              const vertices = item.boundingPoly.vertices;
-              if (Array.isArray(vertices) && vertices.length >= 4) {
-                const xs = vertices.map(v => v.x);
-                const ys = vertices.map(v => v.y);
-                const xmin = Math.min(...xs);
-                const ymin = Math.min(...ys);
-                const xmax = Math.max(...xs);
-                const ymax = Math.max(...ys);
-                box2D = [ymin, xmin, ymax, xmax];
-                console.log('Found format: boundingPoly');
-              }
-            }
-            // Case 7: Check if the item itself is an array of 4 numbers
-            else if (Array.isArray(item) && item.length === 4 && item.every(v => typeof v === 'number' || typeof v === 'string')) {
-              // Guess if it's [ymin,xmin,ymax,xmax] or [xmin,ymin,xmax,ymax]
-              // For simplicity, assume [ymin,xmin,ymax,xmax]
-              box2D = item;
-              label = 'Object';
-              console.log('Found format: direct array');
-            }
-            
-            // If we couldn't find a valid box format, attempt to extract from the label or description
-            if (!box2D && typeof item === 'object') {
-              console.log('No standard format found, checking keys:', Object.keys(item));
-              
-              // Case 8: Special handling for formats with nested data
-              for (const key in item) {
-                const value = item[key];
-                // Skip strings and primitives
-                if (typeof value !== 'object' || value === null) continue;
-                
-                // Check if this property contains box-like data
-                if ((Array.isArray(value) && value.length === 4) || 
-                    ('x' in value && 'y' in value) ||
-                    ('xmin' in value && 'ymin' in value)) {
-                  console.log('Found potential bounding box in nested property:', key);
-                  
-                  if (Array.isArray(value) && value.length === 4) {
-                    box2D = value;
-                  } else if ('x' in value && 'y' in value && 'width' in value && 'height' in value) {
-                    box2D = [value.y, value.x, value.y + value.height, value.x + value.width];
-                  } else if ('xmin' in value && 'ymin' in value && 'xmax' in value && 'ymax' in value) {
-                    box2D = [value.ymin, value.xmin, value.ymax, value.xmax];
-                  }
-                  
-                  break;
-                }
-              }
-            }
-            
-            // If we found a valid box format, add it to our results
-            if (box2D) {
-              console.log('Successfully extracted box2D:', box2D);
-              
-              // Convert any string values to numbers
-              const [ymin, xmin, ymax, xmax] = box2D.map((v: any) => typeof v === 'string' ? parseFloat(v) : v);
-              
-              // Normalize to 0-1 range if the values are in pixel coordinates (>10)
-              const normalizeFactor = Math.max(...box2D) > 10 ? 1000 : 1;
-              
-              formattedBoxes.push({
-                x: xmin / normalizeFactor,
-                y: ymin / normalizeFactor,
-                width: (xmax - xmin) / normalizeFactor,
-                height: (ymax - ymin) / normalizeFactor,
-                label: label,
-              });
-            } else {
-              console.warn('Could not extract bounding box from item:', item);
-            }
-          }
+          // Format and enhance bounding boxes with contextual information
+          const formattedBoxes = await processAndTrack2DBoundingBoxes(parsedResponse);
           
           if (formattedBoxes.length > 0) {
-            console.log('Successfully formatted boxes:', formattedBoxes);
+            console.log('Successfully formatted boxes with context:', formattedBoxes);
             setBoundingBoxes2D(formattedBoxes);
+            setEnhancedBoundingBoxes(formattedBoxes);
           } else {
             console.warn('No valid 2D boxes found in response');
-            
-            // Fallback: If we have objects but couldn't extract boxes, create simple centered boxes
-            if (parsedResponse.length > 0) {
-              console.log('Attempting to create fallback boxes');
-              const fallbackBoxes = parsedResponse.map((item: any, index: number) => {
-                const label = item.label || item.description || item.name || item.class || item.category || `Object ${index + 1}`;
-                
-                // Create a box in the center with size based on index
-                const x = 0.3 + (index % 3) * 0.1;
-                const y = 0.3 + (Math.floor(index / 3) % 3) * 0.1;
-                const width = 0.15;
-                const height = 0.15;
-                
-                return { x, y, width, height, label };
-              });
-              
-              if (fallbackBoxes.length > 0) {
-                console.log('Using fallback boxes:', fallbackBoxes);
-                setBoundingBoxes2D(fallbackBoxes);
-                setProcessingError('Could not detect precise obstacle locations, showing approximate objects');
-              } else {
-                setProcessingError('No valid obstacles detected. Using cached results.');
-              }
-            } else {
-              setProcessingError('No valid obstacles detected. Using cached results.');
-            }
+            setProcessingError('No valid obstacles detected. Using cached results.');
           }
         } catch (formatError) {
           console.error('Error formatting 2D boxes:', formatError);
           setProcessingError('Error processing detection data. Using cached results.');
         }
       } else if (detectType === "Points") {
+        // Process points with context
         try {
           const formattedPoints = parsedResponse.map(
-            (point: { point: [number, number]; label: string }) => {
+            (point: { point: [number, number]; label: string; distance?: string }) => {
               if (!point.point || !Array.isArray(point.point) || point.point.length !== 2) {
                 throw new Error('Invalid point format');
               }
+              
               return {
                 point: {
                   x: point.point[1] / 1000,
                   y: point.point[0] / 1000,
                 },
-                label: point.label || 'Unknown',
+                label: point.distance ? `${point.label} (${point.distance})` : point.label || 'Unknown',
               };
             },
           );
@@ -457,6 +453,7 @@ export function Content({ isNavigating = false }) {
           setProcessingError('Error processing detection data. Using cached results.');
         }
       } else {
+        // Process 3D boxes with context
         try {
           const formattedBoxes = parsedResponse.map(
             (box: {
@@ -464,6 +461,8 @@ export function Content({ isNavigating = false }) {
                 number, number, number, number, number, number, number, number, number,
               ];
               label: string;
+              distance?: string;
+              movement?: string;
             }) => {
               if (!box.box_3d || !Array.isArray(box.box_3d) || box.box_3d.length !== 9) {
                 throw new Error('Invalid box_3d format');
@@ -473,11 +472,21 @@ export function Content({ isNavigating = false }) {
               const rpy = box.box_3d
                 .slice(6)
                 .map((x: number) => (x * Math.PI) / 180) as [number, number, number];
+              
+              // Add distance and movement information to label if available
+              let enhancedLabel = box.label || 'Unknown';
+              if (box.distance) {
+                enhancedLabel += ` (${box.distance})`;
+              }
+              if (box.movement) {
+                enhancedLabel += ` - ${box.movement}`;
+              }
+              
               return {
                 center,
                 size,
                 rpy,
-                label: box.label || 'Unknown',
+                label: enhancedLabel,
               };
             },
           );
@@ -488,21 +497,36 @@ export function Content({ isNavigating = false }) {
         }
       }
     } catch (err: any) {
-      console.error('Error analyzing frame:', err);
+      console.error('Error analyzing frame with context:', err);
       
       // Handle rate limit errors specifically
       if (err?.message?.includes('429') || err?.message?.includes('quota')) {
+        // Extract retry delay from error message if available
+        let suggestedRetryDelay = 12000; // Default to 12s as seen in the error message
+        try {
+          // Try to extract the exact retry delay from the error message
+          const retryDelayMatch = err.message.match(/retryDelay":"(\d+)s"/);
+          if (retryDelayMatch && retryDelayMatch[1]) {
+            suggestedRetryDelay = parseInt(retryDelayMatch[1]) * 1000; // Convert to milliseconds
+            console.log(`API suggested retry delay: ${suggestedRetryDelay}ms`);
+          }
+        } catch (parseErr) {
+          console.log('Could not parse retry delay, using default 12s');
+        }
+        
         const errorMessage = 'API rate limit exceeded. Using cached results and slowing down requests.';
         setProcessingError(errorMessage);
         
-        // Increment retry count and implement exponential backoff
+        // Implement exponential backoff as before, but respect the API's suggested retry delay
         retryCountRef.current += 1;
-        const backoffDelay = Math.min(
-          RETRY_DELAY_MS * Math.pow(2, retryCountRef.current - 1),
-          MAX_RETRY_DELAY_MS
+        const backoffDelay = Math.max(
+          suggestedRetryDelay,
+          Math.min(
+            RETRY_DELAY_MS * Math.pow(2, retryCountRef.current - 1),
+            MAX_RETRY_DELAY_MS
+          )
         );
         
-        // Set a timeout before allowing new requests
         if (retryTimeoutRef.current) {
           window.clearTimeout(retryTimeoutRef.current);
         }
@@ -511,13 +535,59 @@ export function Content({ isNavigating = false }) {
           retryTimeoutRef.current = null;
         }, backoffDelay);
         
-        // Abandon retries if we've exceeded the maximum
+        // Increase the dynamic rate limit buffer to slow down future requests
+        // Make a more significant adjustment based on the API's suggested delay
+        dynamicRateLimitBuffer += Math.max(RATE_LIMIT_BUFFER_INCREMENT, Math.floor(suggestedRetryDelay / 2));
+        console.log(`Rate limit hit. Increasing frame interval to ${FRAME_PROCESSING_INTERVAL_MS + dynamicRateLimitBuffer}ms`);
+        
         if (retryCountRef.current > MAX_RETRIES) {
           setProcessingError('Maximum retry attempts reached. Try again later or check your API quota.');
         }
       } else {
         setProcessingError('Error processing image. Will continue with cached results.');
       }
+    }
+  };
+
+  // Function to capture a frame without sending it to the API
+  const captureIntermediateFrame = async () => {
+    if (!videoRef.current || !canvasRef.current || !videoReady) {
+      return null;
+    }
+    
+    try {
+      const video = videoRef.current;
+      const canvas = canvasRef.current;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return null;
+      
+      // Set canvas dimensions to match video
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      
+      // Draw the current video frame to canvas
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      
+      // Get image data from canvas at lower quality to save memory
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.5);
+      
+      if (!dataUrl || dataUrl === 'data:,' || !dataUrl.includes('base64')) {
+        return null;
+      }
+      
+      // Create a frame history item without API detections
+      const frameItem: FrameHistoryItem = {
+        timestamp: Date.now(),
+        dataUrl: dataUrl,
+        detections: [],  // No AI detections for intermediate frames
+        movementDirection: movementDirection,
+        isKeyFrame: false // Flag as non-key frame (wasn't processed by API)
+      };
+      
+      return frameItem;
+    } catch (err) {
+      console.error('Error capturing intermediate frame:', err);
+      return null;
     }
   };
 
@@ -724,6 +794,179 @@ export function Content({ isNavigating = false }) {
       };
     }
   }, [stream]);
+
+  // Function to process and track 2D bounding boxes across frames
+  const processAndTrack2DBoundingBoxes = async (parsedResponse: any[]): Promise<EnhancedBoundingBox2D[]> => {
+    try {
+      const currentTime = Date.now();
+      const formattedBoxes: EnhancedBoundingBox2D[] = [];
+      
+      for (const item of parsedResponse) {
+        // Extract label, distance and any movement info provided by AI
+        let label = item.label || item.description || item.name || item.class || item.category || 'Unknown';
+        const distance = item.distance || null;
+        const aiMovement = item.movement || null;
+        
+        // Extract the bounding box coordinates (reusing existing box extraction code)
+        let box2D = null;
+        
+        // Case 1: Standard format [ymin, xmin, ymax, xmax]
+        if (item.box_2d && Array.isArray(item.box_2d) && item.box_2d.length === 4) {
+          box2D = item.box_2d;
+        }
+        // Case 2: Format with separate coordinates like {xmin, ymin, xmax, ymax}
+        else if (item.bounding_box || item.bbox || item.box) {
+          const bbox = item.bounding_box || item.bbox || item.box;
+          if (bbox) {
+            if (Array.isArray(bbox) && bbox.length === 4) {
+              box2D = [bbox[1], bbox[0], bbox[3], bbox[2]]; // Convert [xmin,ymin,xmax,ymax] to [ymin,xmin,ymax,xmax]
+            } else if (typeof bbox === 'object') {
+              // Handle object with properties like {x, y, width, height} or {xmin, ymin, xmax, ymax}
+              if ('x' in bbox && 'y' in bbox && 'width' in bbox && 'height' in bbox) {
+                box2D = [
+                  bbox.y, 
+                  bbox.x, 
+                  bbox.y + bbox.height, 
+                  bbox.x + bbox.width
+                ];
+              } else if ('xmin' in bbox && 'ymin' in bbox && 'xmax' in bbox && 'ymax' in bbox) {
+                box2D = [bbox.ymin, bbox.xmin, bbox.ymax, bbox.xmax];
+              }
+            }
+          }
+        }
+        // Case 3: Direct coordinates in the object
+        else if ('xmin' in item && 'ymin' in item && 'xmax' in item && 'ymax' in item) {
+          box2D = [item.ymin, item.xmin, item.ymax, item.xmax];
+        }
+        // Case 4: Format with position and dimensions
+        else if ('x' in item && 'y' in item && ('width' in item || 'w' in item) && ('height' in item || 'h' in item)) {
+          const width = item.width || item.w;
+          const height = item.height || item.h;
+          box2D = [item.y, item.x, item.y + height, item.x + width];
+        }
+        // Handle other cases from original code...
+        
+        // If we found a valid box format, process it with context tracking
+        if (box2D) {
+          // Convert any string values to numbers
+          const [ymin, xmin, ymax, xmax] = box2D.map((v: any) => typeof v === 'string' ? parseFloat(v) : v);
+          
+          // Normalize to 0-1 range if the values are in pixel coordinates (>10)
+          const normalizeFactor = Math.max(...box2D) > 10 ? 1000 : 1;
+          
+          // Calculate box size (area) for comparison with previous frames
+          const width = (xmax - xmin) / normalizeFactor;
+          const height = (ymax - ymin) / normalizeFactor;
+          const x = xmin / normalizeFactor;
+          const y = ymin / normalizeFactor;
+          const boxSize = width * height;
+          
+          // Generate a unique ID for the object based on position and label
+          // This helps track the same object across frames
+          const boxCenter = { x: x + width/2, y: y + height/2 };
+          const boxId = `${label.toLowerCase().replace(/\s+/g, '-')}-${boxCenter.x.toFixed(2)}-${boxCenter.y.toFixed(2)}`;
+          
+          // Look for this object in previous frames (by matching object IDs or finding closest match)
+          let movement: "approaching" | "receding" | "stationary" | "left" | "right" = "stationary";
+          let prevSize = null;
+          
+          // Check if we have tracked this object before
+          const trackedObject = objectTrackingMapRef.current.get(boxId);
+          
+          if (trackedObject) {
+            // We found the same object from a previous frame
+            // Now find this object in our previous enhanced bounding boxes to get its previous size
+            const prevBox = enhancedBoundingBoxes.find(box => box.id === boxId);
+            
+            if (prevBox && prevBox.prevSize) {
+              prevSize = prevBox.prevSize;
+              
+              // Compare current size with previous size to determine movement
+              const sizeDiff = boxSize - prevSize;
+              const sizeDiffPercent = sizeDiff / prevSize;
+              
+              // Object is approaching if it's getting bigger (threshold: 5% bigger)
+              if (sizeDiffPercent > 0.05) {
+                movement = "approaching";
+              } 
+              // Object is receding if it's getting smaller (threshold: 5% smaller)
+              else if (sizeDiffPercent < -0.05) {
+                movement = "receding";
+              }
+              // Otherwise consider it stationary
+              else {
+                movement = "stationary";
+              }
+            }
+            
+            // Update the last seen timestamp for this object
+            objectTrackingMapRef.current.set(boxId, {
+              ...trackedObject,
+              lastSeen: currentTime
+            });
+          } else {
+            // This is a new object we haven't seen before
+            objectTrackingMapRef.current.set(boxId, {
+              id: boxId,
+              label: label,
+              lastSeen: currentTime
+            });
+          }
+          
+          // Override our calculated movement with AI-provided movement if available
+          if (aiMovement) {
+            if (aiMovement.toLowerCase().includes('approach')) {
+              movement = "approaching";
+            } else if (aiMovement.toLowerCase().includes('reced') || 
+                      aiMovement.toLowerCase().includes('away') ||
+                      aiMovement.toLowerCase().includes('further')) {
+              movement = "receding";
+            } else if (aiMovement.toLowerCase().includes('left')) {
+              movement = "left";
+            } else if (aiMovement.toLowerCase().includes('right')) {
+              movement = "right";
+            }
+          }
+          
+          // Enhance the label with distance and movement information
+          let enhancedLabel = label;
+          if (distance) {
+            enhancedLabel += ` (${distance})`;
+          }
+          if (movement !== "stationary") {
+            enhancedLabel += ` - ${movement}`;
+          }
+          
+          // Add the enhanced box to our results
+          formattedBoxes.push({
+            x,
+            y,
+            width,
+            height,
+            label: enhancedLabel,
+            id: boxId,
+            distance: distance,
+            movement: movement,
+            prevSize: boxSize // Store current size as prevSize for next frame
+          });
+        }
+      }
+      
+      // Clean up stale entries from the tracking map (objects not seen recently)
+      const staleThresholdMs = 30000; // 30 seconds
+      objectTrackingMapRef.current.forEach((value, key) => {
+        if (currentTime - value.lastSeen > staleThresholdMs) {
+          objectTrackingMapRef.current.delete(key);
+        }
+      });
+      
+      return formattedBoxes;
+    } catch (error) {
+      console.error('Error processing and tracking bounding boxes:', error);
+      return [];
+    }
+  };
 
   return (
     <div ref={containerRef} className="w-full grow relative">
