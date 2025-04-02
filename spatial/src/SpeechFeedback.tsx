@@ -20,7 +20,6 @@ import { BoundingBoxes2DAtom, BoundingBoxes3DAtom, PointsAtom, DetectTypeAtom, a
 const SPEECH_DELAY_MS = 500;       // Shorter delay before speaking
 const SPEECH_COOLDOWN_MS = 3000;   // Minimum time between announcements
 const SCENE_SUMMARY_INTERVAL = 20000; // Give scene summary every 20 seconds
-const PATH_GUIDANCE_INTERVAL = 6000; // Give path guidance every 6 seconds
 
 export function SpeechFeedback() {
   const [boundingBoxes2D] = useAtom(BoundingBoxes2DAtom);
@@ -30,23 +29,9 @@ export function SpeechFeedback() {
   const [lastSpoken, setLastSpoken] = useState('');
   const [lastSpeechTime, setLastSpeechTime] = useState(0);
   const [lastSceneSummaryTime, setLastSceneSummaryTime] = useState(0);
-  const [lastPathGuidanceTime, setLastPathGuidanceTime] = useState(0);
   const speakTimeoutRef = useRef<number | null>(null);
   const speechInProgressRef = useRef<boolean>(false);
   const [detectionHistory, setDetectionHistory] = useState<Array<{label: string, count: number, lastSeen: number}>>([]);
-  
-  // Track available paths and navigation guidance
-  const [navigationData, setNavigationData] = useState<{
-    paths: string[],
-    safeDirection: string,
-    warnings: string[],
-    lastUpdated: number
-  }>({
-    paths: [],
-    safeDirection: "",
-    warnings: [],
-    lastUpdated: 0
-  });
 
   // Voice selection state
   const [availableVoices, setAvailableVoices] = useAtom(availableVoicesAtom);
@@ -129,154 +114,6 @@ export function SpeechFeedback() {
         points.forEach(point => newObjects.add(point.label));
       }
       
-      // Extract navigation data from object labels or special fields
-      let paths: string[] = [];
-      let safeDirection = "";
-      let warnings: string[] = [];
-      
-      // Look for navigation cues in the objects
-      if (detectType === '2D bounding boxes') {
-        // Check for navigation information in box labels
-        boundingBoxes2D.forEach(box => {
-          const label = box.label.toLowerCase();
-          
-          // Extract path information
-          if (label.includes("path") || label.includes("way") || label.includes("door") || 
-              label.includes("corridor") || label.includes("left") || label.includes("right") ||
-              label.includes("ahead") || label.includes("exit")) {
-            
-            // Try to construct a clear path instruction
-            let pathDirection = "";
-            
-            if (label.includes("left")) pathDirection = "to your left";
-            else if (label.includes("right")) pathDirection = "to your right";
-            else if (label.includes("ahead") || label.includes("forward")) pathDirection = "straight ahead";
-            
-            // If no direction was found in the label, use box position
-            if (!pathDirection) {
-              const centerX = box.x + box.width/2;
-              if (centerX < 0.4) pathDirection = "to your left";
-              else if (centerX > 0.6) pathDirection = "to your right";
-              else pathDirection = "straight ahead";
-            }
-            
-            // Construct full path description
-            let pathDescription = "";
-            if (label.includes("clear path")) {
-              pathDescription = `Clear path ${pathDirection}`;
-            } else if (label.includes("door")) {
-              pathDescription = `Door ${pathDirection}`;
-            } else if (label.includes("exit")) {
-              pathDescription = `Exit ${pathDirection}`;
-            } else if (label.includes("corridor")) {
-              pathDescription = `Corridor ${pathDirection}`;
-            } else if (label.includes("blocked")) {
-              pathDescription = `Path ${pathDirection} is blocked`;
-              warnings.push(`Path ${pathDirection} is blocked`);
-            } else {
-              pathDescription = `Possible path ${pathDirection}`;
-            }
-            
-            // Add to paths if it's not a blocked path
-            if (!label.includes("blocked") && !label.includes("no path")) {
-              paths.push(pathDescription);
-            }
-          }
-          
-          // Extract warning information
-          if (label.includes("caution") || label.includes("warning") || 
-              label.includes("danger") || label.includes("obstacle") ||
-              label.includes("hazard") || label.includes("careful") ||
-              label.includes("watch out")) {
-            
-            // Create a more specific warning message
-            const boxCenterX = box.x + box.width/2;
-            const boxCenterY = box.y + box.height/2;
-            let locationDetail = "";
-            
-            if (boxCenterX < 0.4) locationDetail = "on your left";
-            else if (boxCenterX > 0.6) locationDetail = "on your right";
-            else locationDetail = "in front of you";
-            
-            if (boxCenterY > 0.7) locationDetail += ", very close";
-            
-            const warningMsg = `Caution: ${box.label} ${locationDetail}`;
-            warnings.push(warningMsg);
-          }
-        });
-        
-        // Determine safest direction based on obstacles and paths
-        if (paths.length > 0) {
-          // Prefer forward path if available
-          const forwardPath = paths.find(p => 
-            p.includes("straight ahead") && !p.includes("blocked"));
-          
-          if (forwardPath) {
-            safeDirection = "Continue straight ahead carefully";
-          } else {
-            // Otherwise suggest the first available path
-            const safePath = paths[0];
-            if (safePath.includes("left")) {
-              safeDirection = "Turn left and proceed carefully";
-            } else if (safePath.includes("right")) {
-              safeDirection = "Turn right and proceed carefully";
-            } else {
-              safeDirection = "Proceed carefully toward the available path";
-            }
-          }
-        } else {
-          // If no paths detected, recommend caution
-          const obstacles = boundingBoxes2D.filter(box => {
-            const centerX = box.x + box.width / 2;
-            const centerY = box.y + box.height / 2;
-            return centerX > 0.3 && centerX < 0.7 && centerY > 0.5;
-          });
-          
-          if (obstacles.length > 0) {
-            safeDirection = "Stop and scan around for a clear path";
-          } else {
-            safeDirection = "Proceed very slowly and scan for obstacles";
-          }
-        }
-      }
-      
-      // Look for navigation field in any object (often provided by the API)
-      const navigationObjects = Array.from(newObjects)
-        .filter(label => 
-          label.toLowerCase().includes("path") || 
-          label.toLowerCase().includes("navigation") ||
-          label.toLowerCase().includes("direction"));
-      
-      if (navigationObjects.length > 0) {
-        // Use these as additional navigation cues
-        navigationObjects.forEach(navLabel => {
-          const navInfo = navLabel.toLowerCase();
-          
-          if (navInfo.includes("left") && !paths.some(p => p.includes("left"))) {
-            paths.push("Path to your left");
-          }
-          if (navInfo.includes("right") && !paths.some(p => p.includes("right"))) {
-            paths.push("Path to your right");
-          }
-          if (navInfo.includes("ahead") && !paths.some(p => p.includes("ahead"))) {
-            paths.push("Path straight ahead");
-          }
-          if (navInfo.includes("blocked") && !warnings.some(w => w.includes("blocked"))) {
-            warnings.push("Warning: Blocked path detected");
-          }
-        });
-      }
-      
-      // Update navigation data if we have new information
-      if (paths.length > 0 || safeDirection || warnings.length > 0) {
-        setNavigationData({
-          paths,
-          safeDirection,
-          warnings,
-          lastUpdated: currentTime
-        });
-      }
-      
       // Update detection history
       setDetectionHistory(prev => {
         const updated = [...prev];
@@ -312,23 +149,15 @@ export function SpeechFeedback() {
     const currentTime = Date.now();
     let isUrgent = false;
     let isSummary = false;
-    let isPathGuidance = false;
     
     // Check if it's time for a scene summary
     const shouldGiveSummary = currentTime - lastSceneSummaryTime > SCENE_SUMMARY_INTERVAL &&
-                              detectionHistory.length > 0 &&
-                              !speechInProgressRef.current;
+                             detectionHistory.length > 0 &&
+                             !speechInProgressRef.current;
     
-    // Check if it's time for path guidance
-    const shouldGivePathGuidance = currentTime - lastPathGuidanceTime > PATH_GUIDANCE_INTERVAL &&
-                                  navigationData.lastUpdated > lastPathGuidanceTime &&
-                                  !speechInProgressRef.current;
-    
-    // Only generate new speech if we're not already speaking and enough time has passed,
-    // or if it's time for a summary or path guidance
+    // Only generate new speech if we're not already speaking and enough time has passed
     if (speechInProgressRef.current || 
-        (currentTime - lastSpeechTime < SPEECH_COOLDOWN_MS && 
-         !shouldGiveSummary && !shouldGivePathGuidance)) {
+        (currentTime - lastSpeechTime < SPEECH_COOLDOWN_MS && !shouldGiveSummary)) {
       return;
     }
     
@@ -341,35 +170,6 @@ export function SpeechFeedback() {
         message = `Environment summary: You are in an area with ${topObjects.join(', ')}`;
         setLastSceneSummaryTime(currentTime);
       }
-    } else if (shouldGivePathGuidance) {
-      // Provide guidance on available paths
-      isPathGuidance = true;
-      
-      let pathMessage = "";
-      
-      // Start with warnings if any
-      if (navigationData.warnings.length > 0) {
-        const uniqueWarnings = [...new Set(navigationData.warnings)];
-        const criticalWarnings = uniqueWarnings.slice(0, 2);
-        pathMessage += `${criticalWarnings.join('. ')}. `;
-      }
-      
-      // Then describe available paths
-      if (navigationData.paths.length > 0) {
-        pathMessage += "Available paths: ";
-        const uniquePaths = [...new Set(navigationData.paths)];
-        pathMessage += uniquePaths.slice(0, 3).join('. ');
-      } else {
-        pathMessage += "No clear paths detected. ";
-      }
-      
-      // Finally add the recommended direction
-      if (navigationData.safeDirection) {
-        pathMessage += ` Recommendation: ${navigationData.safeDirection}.`;
-      }
-      
-      message = pathMessage;
-      setLastPathGuidanceTime(currentTime);
     } else if (detectType === '2D bounding boxes' && boundingBoxes2D.length > 0) {
       // Find obstacles that are large or in the center (likely in the path)
       const obstacles = boundingBoxes2D
@@ -400,55 +200,34 @@ export function SpeechFeedback() {
         const hazard = immediateHazards[0];
         const distance = estimateDistance(hazard);
         const position = getDetailedPositionDescription(hazard.x, hazard.y, hazard.width, hazard.height);
-        
-        // Add movement instruction for hazard avoidance
-        let avoidanceInstruction = "";
-        const centerX = hazard.x + hazard.width / 2;
-        
-        if (centerX < 0.5) {
-          avoidanceInstruction = "Move to your right to avoid";
-        } else {
-          avoidanceInstruction = "Move to your left to avoid";
-        }
-        
-        message = `Caution! ${hazard.label} ${position}, ${distance}. ${avoidanceInstruction}.`;
+        message = `Caution! ${hazard.label} ${position}, ${distance}`;
       } else if (obstacles.length > 0) {
         const obstacleDescriptions = obstacles
-          .slice(0, 2) // Take up to 2 most important obstacles
+          .slice(0, 3) // Take up to 3 most important obstacles
           .map(box => {
             const position = getDetailedPositionDescription(box.x, box.y, box.width, box.height);
             const distance = estimateDistance(box);
             return `${box.label} ${position}, ${distance}`;
           });
         
-        // Add basic navigation instruction
-        let navInstruction = "";
-        if (navigationData.safeDirection) {
-          navInstruction = ` ${navigationData.safeDirection}.`;
-        } else {
-          // Generate a basic instruction based on obstacle positions
-          const rightObstacles = obstacles.filter(box => (box.x + box.width/2) > 0.5);
-          const leftObstacles = obstacles.filter(box => (box.x + box.width/2) < 0.5);
-          
-          if (leftObstacles.length > rightObstacles.length) {
-            navInstruction = " Consider moving right.";
-          } else if (rightObstacles.length > leftObstacles.length) {
-            navInstruction = " Consider moving left.";
-          } else {
-            navInstruction = " Proceed with caution.";
-          }
-        }
-        
-        message = `${obstacleDescriptions.join('. ')}.${navInstruction}`;
+        message = `${obstacleDescriptions.join('. ')}`;
       } else {
-        // Path is clear, provide navigation guidance
-        if (navigationData.paths.length > 0) {
-          // Pick the most relevant path
-          const primaryPath = navigationData.paths[0];
-          message = `Path clear. ${primaryPath}. Proceed with caution.`;
+        // Look for objects on the periphery to help with awareness
+        const peripheralObjects = boundingBoxes2D
+          .filter(box => {
+            const centerX = box.x + box.width / 2;
+            return centerX < 0.2 || centerX > 0.8; // Far left or right
+          })
+          .slice(0, 2);
+          
+        if (peripheralObjects.length > 0) {
+          const descriptions = peripheralObjects.map(box => {
+            const position = getDetailedPositionDescription(box.x, box.y, box.width, box.height);
+            return `${box.label} ${position}`;
+          });
+          message = `Path clear. Also seeing: ${descriptions.join(', ')}`;
         } else {
-          // No specific paths found, but area is clear
-          message = 'Path clear ahead. Proceed slowly and watch your step.';
+          message = 'Path clear ahead';
         }
       }
     } else if (detectType === '3D bounding boxes' && boundingBoxes3D.length > 0) {
@@ -468,33 +247,17 @@ export function SpeechFeedback() {
         isUrgent = true;
         const closest = closeObstacles[0];
         const orientation = getOrientationFromBox(closest);
-        
-        // Add avoidance instruction
-        let avoidanceDirection = "";
-        if (closest.center[0] < 0) {
-          avoidanceDirection = "Step right to avoid";
-        } else {
-          avoidanceDirection = "Step left to avoid";
-        }
-        
-        message = `Caution! ${closest.label} very close, ${orientation}. ${avoidanceDirection}.`;
+        message = `Caution! ${closest.label} very close, ${orientation}`;
       } else {
-        // Provide navigational guidance based on 3D scene
         const obstacleDescriptions = sortedObstacles
-          .slice(0, 2)
+          .slice(0, 3)
           .map(box => {
             const distance = estimateDistanceFrom3DBox(box);
             const orientation = getOrientationFromBox(box);
             return `${box.label} ${distance} ${orientation}`;
           });
         
-        // Add path information if available
-        let pathGuidance = "";
-        if (navigationData.paths.length > 0) {
-          pathGuidance = ` Available path: ${navigationData.paths[0]}.`;
-        }
-        
-        message = `${obstacleDescriptions.join('. ')}.${pathGuidance}`;
+        message = `${obstacleDescriptions.join('. ')}`;
       }
     } else if (points.length > 0) {
       // Points based detection is useful for identifying specific features
@@ -510,37 +273,26 @@ export function SpeechFeedback() {
           const position = getPositionDescriptionFromPoint(point.point.x, point.point.y);
           return `${point.label} ${position}`;
         });
-        
-        // Add movement guidance for points
-        let movementAdvice = "";
-        if (navigationData.safeDirection) {
-          movementAdvice = ` ${navigationData.safeDirection}`;
-        } else {
-          // Provide generic movement advice
-          movementAdvice = " Proceed with caution.";
-        }
-        
-        message = `${descriptions.join('. ')}.${movementAdvice}`;
+        message = `${descriptions.join('. ')}`;
       } else {
-        // No critical points in center, check for path information
-        if (navigationData.paths.length > 0) {
-          message = `No immediate obstacles. ${navigationData.paths[0]}. Proceed carefully.`;
-        } else {
-          message = 'No immediate obstacles. Proceed slowly and scan for paths.';
-        }
+        const peripheralPoints = points.slice(0, 2);
+        const descriptions = peripheralPoints.map(point => {
+          const position = getPositionDescriptionFromPoint(point.point.x, point.point.y);
+          return `${point.label} ${position}`;
+        });
+        message = `Note: ${descriptions.join(', ')}`;
       }
     }
     
     // Only speak if we have a new message and it's different from the last one
-    // or if it's path guidance or a summary (these should be repeated)
-    if (message && (message !== lastSpoken || isSummary || isPathGuidance)) {
+    if (message && (message !== lastSpoken || isSummary)) {
       // Clear any pending speech
       if (speakTimeoutRef.current) {
         window.clearTimeout(speakTimeoutRef.current);
       }
       
-      // For urgent messages, summaries, or path guidance, cancel ongoing speech
-      if (isUrgent || isSummary || isPathGuidance) {
+      // For urgent messages or summaries, cancel ongoing speech
+      if (isUrgent || isSummary) {
         if ('speechSynthesis' in window) {
           window.speechSynthesis.cancel();
         }
@@ -549,7 +301,7 @@ export function SpeechFeedback() {
       // Set a short delay before speaking
       speakTimeoutRef.current = window.setTimeout(() => {
         speechInProgressRef.current = true;
-        speakText(message, isUrgent, isSummary || isPathGuidance);
+        speakText(message, isUrgent, isSummary);
         setLastSpoken(message);
         setLastSpeechTime(Date.now());
       }, SPEECH_DELAY_MS);
@@ -560,11 +312,10 @@ export function SpeechFeedback() {
         window.clearTimeout(speakTimeoutRef.current);
       }
     };
-  }, [boundingBoxes2D, boundingBoxes3D, points, detectType, lastSpoken, lastSpeechTime, 
-      lastSceneSummaryTime, lastPathGuidanceTime, detectionHistory, navigationData]);
+  }, [boundingBoxes2D, boundingBoxes3D, points, detectType, lastSpoken, lastSpeechTime, lastSceneSummaryTime, detectionHistory]);
   
   // Function to speak text using the Web Speech API
-  const speakText = (text: string, isUrgent = false, isInformational = false) => {
+  const speakText = (text: string, isUrgent = false, isSummary = false) => {
     if ('speechSynthesis' in window) {
       const speech = new SpeechSynthesisUtterance(text);
       
@@ -616,7 +367,7 @@ export function SpeechFeedback() {
     const depth = box.center[2];
     if (depth < 1) return "within arm's reach";
     if (depth < 2) return "very close";
-    if (depth < 3) return "close";
+    if (depth < 3.5) return "close";
     if (depth < 5) return "approaching";
     return "in the distance";
   };
