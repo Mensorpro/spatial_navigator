@@ -27,6 +27,8 @@ import { useResetState } from "./hooks";
 import { NavigationControls } from "./NavigationControls";
 import { SpeechFeedback } from "./SpeechFeedback";
 import { NavigationAudioGuide } from "./NavigationAudioGuide";
+import { ConsoleCard } from "./components/ConsoleCard";
+import { APIKeySetup } from "./components/APIKeySetup";
 
 function App() {
   const resetState = useResetState();
@@ -175,6 +177,8 @@ function App() {
           </div>
         )}
       </div>
+      <ConsoleCard />
+      <APIKeySetup />
     </div>
   );
 }
