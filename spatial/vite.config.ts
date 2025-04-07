@@ -19,4 +19,8 @@ import react from '@vitejs/plugin-react'
 export default defineConfig({
   base: './',
   plugins: [react()],
+  // server: {
+  //   host: true, // Listen on all network interfaces
+  //   https: true, // Enable HTTPS (required for camera access)
+  // }
 })

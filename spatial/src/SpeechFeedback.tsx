@@ -14,7 +14,7 @@
 
 import { useEffect, useState, useRef } from 'react';
 import { useAtom } from 'jotai';
-import { BoundingBoxes2DAtom, BoundingBoxes3DAtom, PointsAtom, DetectTypeAtom } from './atoms';
+import { BoundingBoxes2DAtom, BoundingBoxes3DAtom, PointsAtom, DetectTypeAtom, availableVoicesAtom, selectedVoiceAtom, preferredVoiceNameAtom } from './atoms';
 
 // Speech timing constants
 const SPEECH_DELAY_MS = 500;       // Shorter delay before speaking
@@ -32,6 +32,72 @@ export function SpeechFeedback() {
   const speakTimeoutRef = useRef<number | null>(null);
   const speechInProgressRef = useRef<boolean>(false);
   const [detectionHistory, setDetectionHistory] = useState<Array<{label: string, count: number, lastSeen: number}>>([]);
+
+  // Voice selection state
+  const [availableVoices, setAvailableVoices] = useAtom(availableVoicesAtom);
+  const [selectedVoice, setSelectedVoice] = useAtom(selectedVoiceAtom);
+  const [preferredVoiceName, setPreferredVoiceName] = useAtom(preferredVoiceNameAtom);
+
+  // Get available voices when component mounts and when voiceschanged event fires
+  useEffect(() => {
+    const loadVoices = () => {
+      if ('speechSynthesis' in window) {
+        const voices = window.speechSynthesis.getVoices();
+        if (voices.length > 0) {
+          setAvailableVoices(voices);
+          
+          // If no voice is selected yet, try to select a good default
+          if (!selectedVoice) {
+            if (preferredVoiceName) {
+              const savedVoice = voices.find(v => v.name === preferredVoiceName);
+              if (savedVoice) {
+                setSelectedVoice(savedVoice);
+                return;
+              }
+            }
+            
+            // Look for natural voice identifiers
+            const naturalVoicePatterns = [
+                /neural/i, /natural/i, /enhanced/i, /premium/i,
+                /wavenet/i, /online/i, /plus/i, /modern/i
+            ];
+            
+            // Try to find a neural/natural English voice
+            const naturalEnglishVoice = voices.find(v => 
+                v.lang.startsWith('en') && 
+                naturalVoicePatterns.some(pattern => pattern.test(v.name))
+            );
+            
+            if (naturalEnglishVoice) {
+                setSelectedVoice(naturalEnglishVoice);
+                setPreferredVoiceName(naturalEnglishVoice.name);
+                return;
+            }
+            
+            // Next try any English voice
+            const englishVoice = voices.find(v => v.lang.startsWith('en'));
+            if (englishVoice) {
+                setSelectedVoice(englishVoice);
+                setPreferredVoiceName(englishVoice.name);
+                return;
+            }
+            
+            // Fallback to first voice
+            if (voices.length > 0) {
+                setSelectedVoice(voices[0]);
+                setPreferredVoiceName(voices[0].name);
+            }
+          }
+        }
+      }
+    };
+
+    loadVoices();
+    window.speechSynthesis.addEventListener('voiceschanged', loadVoices);
+    return () => {
+      window.speechSynthesis.removeEventListener('voiceschanged', loadVoices);
+    };
+  }, []);
 
   // Update detection history for scene summary
   useEffect(() => {
@@ -253,27 +319,30 @@ export function SpeechFeedback() {
     if ('speechSynthesis' in window) {
       const speech = new SpeechSynthesisUtterance(text);
       
+      // Use the selected natural voice if available
+      if (selectedVoice) {
+        speech.voice = selectedVoice;
+      }
+      
       // Adjust speech properties based on message type
       if (isUrgent) {
-        speech.rate = 1.3; // Faster for urgent messages
-        speech.pitch = 1.2; // Slightly higher pitch for urgency
+        speech.rate = 1.2; // Slightly faster for urgent messages
+        speech.pitch = 1.1; // Slightly higher pitch for urgency
         speech.volume = 1.0;
       } else if (isSummary) {
         speech.rate = 1.0; // Normal speed for summaries
-        speech.pitch = 0.9; // Slightly lower pitch for summaries
-        speech.volume = 0.9;
+        speech.pitch = 0.95; // Slightly lower pitch for summaries
+        speech.volume = 0.95;
       } else {
-        speech.rate = 1.2; // Slightly faster than normal for regular announcements
+        speech.rate = 1.1; // Slightly faster than normal
         speech.pitch = 1.0;
         speech.volume = 1.0;
       }
       
-      // Track when speech ends
       speech.onend = () => {
         speechInProgressRef.current = false;
       };
       
-      // Also handle cases where speech might be interrupted
       speech.onerror = () => {
         speechInProgressRef.current = false;
       };
@@ -371,11 +440,47 @@ export function SpeechFeedback() {
     return `${horizontalPosition}, ${verticalPosition}`;
   };
   
+  // Function to handle voice selection change
+  const handleVoiceChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
+    const voiceName = e.target.value;
+    const voice = availableVoices.find(v => v.name === voiceName) || null;
+    setSelectedVoice(voice);
+    setPreferredVoiceName(voiceName);
+    
+    // Speak a test phrase with the new voice
+    if (voice && 'speechSynthesis' in window) {
+      const testSpeech = new SpeechSynthesisUtterance("Voice selected");
+      testSpeech.voice = voice;
+      window.speechSynthesis.speak(testSpeech);
+    }
+  };
+  
   return (
     <div className="absolute bottom-4 left-4 right-4 bg-black bg-opacity-70 text-white p-3 rounded-lg z-10">
-      <div className="flex items-center gap-2">
-        <span className="text-lg">🔊</span>
-        <span>{lastSpoken || "Waiting for detection results..."}</span>
+      <div className="flex flex-col gap-3">
+        <div className="flex items-center gap-2">
+          <span className="text-lg">🔊</span>
+          <span>{lastSpoken || "Waiting for detection results..."}</span>
+        </div>
+        
+        {/* Voice selector */}
+        {availableVoices.length > 0 && (
+          <div className="flex items-center gap-2 text-sm">
+            <label htmlFor="voice-select">Voice:</label>
+            <select 
+              id="voice-select"
+              className="bg-gray-800 border border-gray-700 rounded px-2 py-1 text-sm flex-1"
+              value={selectedVoice?.name || ''}
+              onChange={handleVoiceChange}
+            >
+              {availableVoices.map(voice => (
+                <option key={voice.name} value={voice.name}>
+                  {voice.name} ({voice.lang})
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
       </div>
     </div>
   );

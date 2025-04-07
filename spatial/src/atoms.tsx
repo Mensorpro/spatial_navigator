@@ -91,3 +91,8 @@ export const AudioFeedbackEnabledAtom = atom(true);
 export const DirectionalAudioEnabledAtom = atom(false);
 export const VibrationFeedbackEnabledAtom = atom(false);
 export const SceneSummaryEnabledAtom = atom(true);
+
+// Voice-related atoms
+export const availableVoicesAtom = atom<SpeechSynthesisVoice[]>([]);
+export const selectedVoiceAtom = atom<SpeechSynthesisVoice | null>(null);
+export const preferredVoiceNameAtom = atom<string | null>(null);
